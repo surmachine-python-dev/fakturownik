@@ -12,7 +12,16 @@ from sqlalchemy.orm import selectinload
 
 from fakturownik.config import AppPaths, get_app_paths
 from fakturownik.database import session_scope
-from fakturownik.models import Attachment, Client, FinalInvoice, Product, Receipt, ReceiptItem
+from fakturownik.models import (
+    Attachment,
+    Client,
+    DEFAULT_SETTLEMENT_TYPE,
+    FinalInvoice,
+    Product,
+    Receipt,
+    ReceiptItem,
+    SettlementTypeConfig,
+)
 from fakturownik.services.calculations import calculate_item, calculate_total, to_decimal
 
 
@@ -20,6 +29,14 @@ from fakturownik.services.calculations import calculate_item, calculate_total, t
 class ClientInput:
     company_name: str
     nip: str
+    settlement_type: str = DEFAULT_SETTLEMENT_TYPE
+
+
+@dataclass
+class SettlementTypeConfigInput:
+    settlement_type: str
+    color_hex: str
+    original_settlement_type: str | None = None
 
 
 @dataclass
@@ -101,9 +118,86 @@ class DocumentService:
             statement = select(Client).order_by(Client.company_name.asc(), Client.id.asc())
             return list(session.scalars(statement))
 
+    def list_settlement_type_configs(self) -> list[SettlementTypeConfig]:
+        with session_scope() as session:
+            statement = select(SettlementTypeConfig).order_by(func.lower(SettlementTypeConfig.settlement_type), SettlementTypeConfig.settlement_type)
+            return list(session.scalars(statement))
+
+    def save_settlement_type_config(self, payload: SettlementTypeConfigInput) -> SettlementTypeConfig:
+        settlement_type = self._normalize_settlement_type(payload.settlement_type)
+        original_settlement_type = self._normalize_optional_settlement_type(payload.original_settlement_type)
+        color_hex = self._validate_color_hex(payload.color_hex)
+
+        with session_scope() as session:
+            if original_settlement_type is None:
+                config = session.get(SettlementTypeConfig, settlement_type)
+                if config is None:
+                    config = SettlementTypeConfig(settlement_type=settlement_type, color_hex=color_hex)
+                    session.add(config)
+                else:
+                    config.color_hex = color_hex
+            else:
+                config = session.get(SettlementTypeConfig, original_settlement_type)
+                if config is None:
+                    raise ValueError("Nie znaleziono typu rozliczenia do edycji.")
+                if settlement_type != original_settlement_type:
+                    duplicate = session.get(SettlementTypeConfig, settlement_type)
+                    if duplicate is not None:
+                        raise ValueError("Typ rozliczenia o takiej nazwie juz istnieje.")
+                    clients = session.scalars(select(Client).where(Client.settlement_type == original_settlement_type))
+                    for client in clients:
+                        client.settlement_type = settlement_type
+                    config.settlement_type = settlement_type
+                config.color_hex = color_hex
+
+            session.flush()
+            session.refresh(config)
+            return config
+
+    def delete_settlement_type_config(self, settlement_type: str) -> str:
+        normalized_type = self._normalize_settlement_type(settlement_type)
+
+        with session_scope() as session:
+            configs = list(
+                session.scalars(
+                    select(SettlementTypeConfig).order_by(
+                        func.lower(SettlementTypeConfig.settlement_type),
+                        SettlementTypeConfig.settlement_type,
+                    )
+                )
+            )
+            if len(configs) <= 1:
+                raise ValueError("Musi istniec co najmniej jeden typ rozliczenia.")
+
+            config = session.get(SettlementTypeConfig, normalized_type)
+            if config is None:
+                raise ValueError("Nie znaleziono typu rozliczenia do usuniecia.")
+
+            replacement = next(item for item in configs if item.settlement_type != normalized_type)
+            clients = session.scalars(select(Client).where(Client.settlement_type == normalized_type))
+            for client in clients:
+                client.settlement_type = replacement.settlement_type
+
+            session.delete(config)
+            return replacement.settlement_type
+
+    def get_client_color_map_by_nip(self) -> dict[str, str]:
+        with session_scope() as session:
+            clients = list(session.scalars(select(Client)))
+            color_by_type = {
+                config.settlement_type: config.color_hex
+                for config in session.scalars(select(SettlementTypeConfig))
+            }
+            return {
+                client.nip: color_by_type[client.settlement_type]
+                for client in clients
+                if client.settlement_type in color_by_type
+            }
+
     def save_client(self, payload: ClientInput, client_id: int | None = None) -> Client:
         company_name = payload.company_name.strip()
         nip = payload.nip.strip()
+        settlement_type = self._normalize_settlement_type(payload.settlement_type)
         if not company_name:
             raise ValueError("Nazwa klienta jest wymagana.")
         if not nip:
@@ -113,9 +207,11 @@ class DocumentService:
             existing_client = session.scalar(select(Client).where(Client.nip == nip))
             if existing_client is not None and existing_client.id != client_id:
                 raise ValueError("Klient z takim NIP juz istnieje.")
+            if session.get(SettlementTypeConfig, settlement_type) is None:
+                raise ValueError("Wybierz istniejacy typ rozliczenia klienta.")
 
             if client_id is None:
-                client = Client(company_name=company_name, nip=nip)
+                client = Client(company_name=company_name, nip=nip, settlement_type=settlement_type)
                 session.add(client)
             else:
                 client = session.get(Client, client_id)
@@ -123,6 +219,7 @@ class DocumentService:
                     raise ValueError("Nie znaleziono klienta do edycji.")
                 client.company_name = company_name
                 client.nip = nip
+                client.settlement_type = settlement_type
 
             session.flush()
             session.refresh(client)
@@ -370,6 +467,25 @@ class DocumentService:
             return source_path.resolve().parent == self.paths.attachments_dir.resolve()
         except FileNotFoundError:
             return False
+
+    def _normalize_settlement_type(self, settlement_type: str) -> str:
+        normalized_type = settlement_type.strip().lower()
+        if not normalized_type:
+            raise ValueError("Typ rozliczenia jest wymagany.")
+        return normalized_type
+
+    def _normalize_optional_settlement_type(self, settlement_type: str | None) -> str | None:
+        if settlement_type is None:
+            return None
+        return self._normalize_settlement_type(settlement_type)
+
+    def _validate_color_hex(self, color_hex: str) -> str:
+        normalized_color = color_hex.strip().upper()
+        if len(normalized_color) != 7 or not normalized_color.startswith("#"):
+            raise ValueError("Kolor musi miec format #RRGGBB.")
+        if any(character not in "0123456789ABCDEF" for character in normalized_color[1:]):
+            raise ValueError("Kolor musi miec format #RRGGBB.")
+        return normalized_color
 
 
 def build_receipt_item_input(raw_item: dict[str, object]) -> ReceiptItemInput:

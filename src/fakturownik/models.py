@@ -13,6 +13,12 @@ class Base(DeclarativeBase):
 
 Money = Numeric(12, 2)
 WeightValue = Numeric(12, 3)
+DEFAULT_SETTLEMENT_TYPE = "inne"
+DEFAULT_SETTLEMENT_TYPE_COLORS = {
+    "mix": "#FFF4CC",
+    "faktura zbiorcza": "#DDEBFF",
+    "inne": "#ECECEC",
+}
 
 
 class Client(Base):
@@ -22,7 +28,15 @@ class Client(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     company_name: Mapped[str] = mapped_column(String(255), nullable=False)
     nip: Mapped[str] = mapped_column(String(32), nullable=False)
+    settlement_type: Mapped[str] = mapped_column(String(64), nullable=False, default=DEFAULT_SETTLEMENT_TYPE)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class SettlementTypeConfig(Base):
+    __tablename__ = "settlement_type_configs"
+
+    settlement_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    color_hex: Mapped[str] = mapped_column(String(7), nullable=False)
 
 
 class Product(Base):

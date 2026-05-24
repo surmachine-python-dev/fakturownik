@@ -22,7 +22,7 @@ from fakturownik.models import (
     ReceiptItem,
     SettlementTypeConfig,
 )
-from fakturownik.services.calculations import calculate_item, calculate_total, to_decimal
+from fakturownik.services.calculations import calculate_item, calculate_total, money, to_decimal
 
 
 @dataclass
@@ -493,11 +493,23 @@ def build_receipt_item_input(raw_item: dict[str, object]) -> ReceiptItemInput:
     weight_value = raw_item.get("weight")
     unit_price_value = raw_item.get("unit_price")
     value_value = raw_item.get("value")
+    price_driver_value = raw_item.get("price_driver")
 
     quantity = int(quantity_value) if quantity_value not in (None, "") else None
     weight = to_decimal(weight_value) if weight_value not in (None, "") else None
     unit_price = to_decimal(unit_price_value) if unit_price_value not in (None, "") else None
     value = to_decimal(value_value) if value_value not in (None, "") else None
+
+    price_driver = str(price_driver_value) if price_driver_value in {"unit_price", "value"} else None
+    if price_driver is None and unit_price is not None and value is not None:
+        measure = Decimal(quantity) if quantity is not None else weight
+        if measure is not None and money(measure * unit_price) != money(value):
+            price_driver = "value"
+
+    if price_driver == "value":
+        unit_price = None
+    elif price_driver == "unit_price":
+        value = None
 
     return ReceiptItemInput(
         product_name=str(raw_item.get("product_name", "")),

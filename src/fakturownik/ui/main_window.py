@@ -78,6 +78,39 @@ def measure_text(quantity: int | None, weight: Decimal | None) -> str:
     return ""
 
 
+def aggregate_measure_text(quantity: int | None, weight: Decimal | None) -> str:
+    parts: list[str] = []
+    if quantity is not None:
+        parts.append(str(quantity))
+    if weight is not None:
+        parts.append(f"{weight:.3f}")
+    return " / ".join(parts)
+
+
+def weight_text(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.3f} kg"
+
+
+def infer_price_driver(
+    quantity: int | None,
+    weight: Decimal | None,
+    unit_price: Decimal | None,
+    value: Decimal | None,
+) -> str:
+    if unit_price is None:
+        return "value"
+    if value is None:
+        return "unit_price"
+
+    measure = Decimal(quantity) if quantity is not None else weight
+    if measure is None:
+        return "unit_price"
+
+    return "unit_price" if money(measure * unit_price) == money(value) else "value"
+
+
 def build_brand_logo(size: int = 36) -> QPixmap:
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
@@ -333,6 +366,7 @@ class FinalInvoicePreviewDialog(QDialog):
 
         def _build_invoice_body_html(self, summary_background: str, table_header_background: str) -> str:
                 receipt_sections: list[str] = []
+                aggregated_items: dict[str, dict[str, Decimal | int | bool]] = {}
                 for receipt in self.final_invoice.receipts:
                         item_rows = "".join(
                                 (
@@ -345,6 +379,22 @@ class FinalInvoicePreviewDialog(QDialog):
                                 )
                                 for item in receipt.items
                         )
+                        for item in receipt.items:
+                                aggregated_item = aggregated_items.setdefault(
+                                        item.product_name,
+                                        {
+                                                "quantity": 0,
+                                                "weight": Decimal("0.000"),
+                                                "has_quantity": False,
+                                                "has_weight": False,
+                                        },
+                                )
+                                if item.quantity is not None:
+                                        aggregated_item["quantity"] = int(aggregated_item["quantity"] or 0) + item.quantity
+                                        aggregated_item["has_quantity"] = True
+                                if item.weight is not None:
+                                        aggregated_item["weight"] = Decimal(aggregated_item["weight"] or Decimal("0.000")) + item.weight
+                                        aggregated_item["has_weight"] = True
                         receipt_sections.append(
                                 "<div class='receipt-block'>"
                                 f"<div class='receipt-header'><span class='receipt-title'>Rachunek #{receipt.id}</span><span>Data: {escape(receipt.issue_date.isoformat())}</span><span>Razem: {escape(decimal_text(receipt.total))}</span></div>"
@@ -356,6 +406,24 @@ class FinalInvoicePreviewDialog(QDialog):
                         )
 
                 receipts_count = len(self.final_invoice.receipts)
+                aggregated_rows = "".join(
+                        (
+                            "<tr>"
+                            f"<td class='col-name'>{escape(product_name)}</td>"
+                            f"<td class='col-measure'>{escape(aggregate_measure_text(data['quantity'] if data['has_quantity'] else None, data['weight'] if data['has_weight'] else None))}</td>"
+                            "</tr>"
+                        )
+                        for product_name, data in aggregated_items.items()
+                    )
+                aggregated_html = (
+                        "<div class='receipt-block aggregate-block'>"
+                        "<div class='receipt-header'><span class='receipt-title'>Suma towarow</span></div>"
+                        "<table class='items-table aggregate-table'>"
+                        "<thead><tr><th>Towar</th><th>Ilosc / waga</th></tr></thead>"
+                        f"<tbody>{aggregated_rows}</tbody>"
+                        "</table>"
+                        "</div>"
+                    ) if aggregated_rows else ""
                 receipts_html = "".join(receipt_sections) or "<p class='empty'>Brak powiazanych rachunkow.</p>"
                 intro_text = "Dokument zbiorczy wygenerowany na podstawie rachunkow zarejestrowanych w systemie."
                 return f"""
@@ -454,6 +522,11 @@ class FinalInvoicePreviewDialog(QDialog):
                         font-weight: 700;
                         text-align: left;
                     }}
+                    .aggregate-block {{
+                        margin-bottom: 26px;
+                    }}
+                    .aggregate-table .col-name {{ width: 70%; }}
+                    .aggregate-table .col-measure {{ width: 30%; }}
                     .col-name {{ width: 46%; }}
                     .col-measure {{ width: 16%; text-align: center; }}
                     .col-money {{ width: 19%; text-align: right; }}
@@ -496,6 +569,7 @@ class FinalInvoicePreviewDialog(QDialog):
                         </tr>
                     </table>
 
+                    {aggregated_html}
                     {receipts_html}
                 </div>
                 """
@@ -865,6 +939,7 @@ class ReceiptEditor(QWidget):
             "weight": result.weight,
             "unit_price": result.unit_price,
             "value": result.value,
+            "price_driver": self.last_price_driver,
         }
 
         existing_row = self._find_matching_item_row(item_data)
@@ -900,7 +975,17 @@ class ReceiptEditor(QWidget):
             self.weight_input.setValue(float(item_data["weight"] or 0))
             self.unit_price_input.setValue(float(item_data["unit_price"] or 0))
             self.value_input.setValue(float(item_data["value"] or 0))
-            self.last_price_driver = "unit_price"
+            self.last_price_driver = str(
+                item_data.get(
+                    "price_driver",
+                    infer_price_driver(
+                        item_data["quantity"],
+                        item_data["weight"],
+                        item_data["unit_price"],
+                        item_data["value"],
+                    ),
+                )
+            )
         finally:
             self._building_form = False
 
@@ -1017,10 +1102,18 @@ class ReceiptEditor(QWidget):
                 "weight": receipt_item.weight,
                 "unit_price": receipt_item.unit_price,
                 "value": receipt_item.value,
+                "price_driver": infer_price_driver(
+                    receipt_item.quantity,
+                    receipt_item.weight,
+                    receipt_item.unit_price,
+                    receipt_item.value,
+                ),
             }
             for column, key in enumerate(["product_name", "quantity", "weight", "unit_price", "value"]):
                 value = item_data[key]
-                if isinstance(value, Decimal):
+                if key == "weight":
+                    text = weight_text(value)
+                elif isinstance(value, Decimal):
                     text = decimal_text(value)
                 else:
                     text = "" if value is None else str(value)
@@ -1103,21 +1196,44 @@ class ReceiptEditor(QWidget):
 
     def _merge_item_data(self, row: int, new_item_data: dict) -> dict:
         existing_data = self.items_table.item(row, 0).data(Qt.UserRole)
+        existing_price_driver = str(
+            existing_data.get(
+                "price_driver",
+                infer_price_driver(
+                    existing_data["quantity"],
+                    existing_data["weight"],
+                    existing_data["unit_price"],
+                    existing_data["value"],
+                ),
+            )
+        )
+        new_price_driver = str(
+            new_item_data.get(
+                "price_driver",
+                infer_price_driver(
+                    new_item_data["quantity"],
+                    new_item_data["weight"],
+                    new_item_data["unit_price"],
+                    new_item_data["value"],
+                ),
+            )
+        )
+        merged_price_driver = "value" if "value" in {existing_price_driver, new_price_driver} else "unit_price"
         if existing_data["quantity"] is not None:
             merged_quantity = existing_data["quantity"] + new_item_data["quantity"]
             result = calculate_item(
                 quantity=merged_quantity,
                 weight=None,
-                unit_price=existing_data["unit_price"],
-                value=None,
+                unit_price=existing_data["unit_price"] if merged_price_driver == "unit_price" else None,
+                value=(existing_data["value"] + new_item_data["value"]) if merged_price_driver == "value" else None,
             )
         else:
             merged_weight = existing_data["weight"] + new_item_data["weight"]
             result = calculate_item(
                 quantity=None,
                 weight=merged_weight,
-                unit_price=existing_data["unit_price"],
-                value=None,
+                unit_price=existing_data["unit_price"] if merged_price_driver == "unit_price" else None,
+                value=(existing_data["value"] + new_item_data["value"]) if merged_price_driver == "value" else None,
             )
 
         return {
@@ -1126,12 +1242,15 @@ class ReceiptEditor(QWidget):
             "weight": result.weight,
             "unit_price": result.unit_price,
             "value": result.value,
+            "price_driver": merged_price_driver,
         }
 
     def _set_items_table_row(self, row: int, item_data: dict) -> None:
         for column, key in enumerate(["product_name", "quantity", "weight", "unit_price", "value"]):
             value = item_data[key]
-            if isinstance(value, Decimal):
+            if key == "weight":
+                text = weight_text(value)
+            elif isinstance(value, Decimal):
                 text = decimal_text(value)
             else:
                 text = "" if value is None else str(value)
@@ -2169,6 +2288,7 @@ class MainWindow(QMainWindow):
 
     def refresh_related_views(self) -> None:
         self.clients_editor.refresh_clients()
+        self.products_editor.refresh_products()
         self.receipt_editor.refresh_clients()
         self.receipt_editor.refresh_products()
         self.receipt_editor.refresh_receipts()
@@ -2199,10 +2319,9 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Blad importu", str(exc))
             return
-        self.receipt_editor.refresh_receipts()
+        self.refresh_related_views()
+        self.products_editor.reset_form()
         self.receipt_editor.reset_form()
-        self.clients_editor.refresh_clients()
-        self.final_invoice_editor.refresh()
         QMessageBox.information(self, "Import", "Backup zostal odtworzony.")
 
 

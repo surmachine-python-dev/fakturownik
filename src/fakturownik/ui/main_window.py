@@ -7,13 +7,14 @@ from pathlib import Path
 import sys
 
 from PySide6.QtCore import QMarginsF, QPointF, QRectF, QSizeF, Qt
-from PySide6.QtGui import QColor, QIcon, QPageLayout, QPageSize, QPainter, QPainterPath, QPdfWriter, QPen, QPixmap, QTextDocument
+from PySide6.QtGui import QColor, QIcon, QPageLayout, QPageSize, QPainter, QPainterPath, QPalette, QPdfWriter, QPen, QPixmap, QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QComboBox,
     QCompleter,
+    QColorDialog,
     QDateEdit,
     QDialog,
     QDoubleSpinBox,
@@ -45,10 +46,18 @@ from PySide6.QtWidgets import (
 
 from fakturownik.config import get_app_paths
 from fakturownik.database import init_database
-from fakturownik.models import FinalInvoice
+from fakturownik.models import DEFAULT_SETTLEMENT_TYPE_COLORS, FinalInvoice
 from fakturownik.services.backup import export_backup, import_backup
 from fakturownik.services.calculations import calculate_item, money, to_decimal
-from fakturownik.services.documents import ClientInput, DocumentService, FinalInvoiceInput, ProductInput, ReceiptInput, build_receipt_item_input
+from fakturownik.services.documents import (
+    ClientInput,
+    DocumentService,
+    FinalInvoiceInput,
+    ProductInput,
+    ReceiptInput,
+    SettlementTypeConfigInput,
+    build_receipt_item_input,
+)
 
 
 BRAND_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "app_icon.ico"
@@ -58,7 +67,7 @@ RECEIPT_WARNING_TOTAL = Decimal("14500.00")
 def decimal_text(value: Decimal | None) -> str:
     if value is None:
         return ""
-    return f"{money(value):.2f}"
+    return f"{money(value):.2f} zł"
 
 
 def measure_text(quantity: int | None, weight: Decimal | None) -> str:
@@ -67,6 +76,39 @@ def measure_text(quantity: int | None, weight: Decimal | None) -> str:
     if weight is not None:
         return f"{weight:.3f}"
     return ""
+
+
+def aggregate_measure_text(quantity: int | None, weight: Decimal | None) -> str:
+    parts: list[str] = []
+    if quantity is not None:
+        parts.append(str(quantity))
+    if weight is not None:
+        parts.append(f"{weight:.3f}")
+    return " / ".join(parts)
+
+
+def weight_text(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.3f} kg"
+
+
+def infer_price_driver(
+    quantity: int | None,
+    weight: Decimal | None,
+    unit_price: Decimal | None,
+    value: Decimal | None,
+) -> str:
+    if unit_price is None:
+        return "value"
+    if value is None:
+        return "unit_price"
+
+    measure = Decimal(quantity) if quantity is not None else weight
+    if measure is None:
+        return "unit_price"
+
+    return "unit_price" if money(measure * unit_price) == money(value) else "value"
 
 
 def build_brand_logo(size: int = 36) -> QPixmap:
@@ -110,6 +152,34 @@ def load_brand_icon() -> QIcon:
     return QIcon(build_brand_logo(64))
 
 
+def apply_dark_theme(app: QApplication) -> None:
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#1e1f22"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#f2f2f2"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#2b2d30"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#25272b"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#2b2d30"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#f2f2f2"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#f2f2f2"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#2b2d30"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#f2f2f2"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#0f766e"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#a1a1aa"))
+    palette.setColor(QPalette.ColorRole.Light, QColor("#3b3d41"))
+    palette.setColor(QPalette.ColorRole.Midlight, QColor("#313338"))
+    palette.setColor(QPalette.ColorRole.Dark, QColor("#1a1b1e"))
+    palette.setColor(QPalette.ColorRole.Mid, QColor("#232428"))
+    palette.setColor(QPalette.ColorRole.Shadow, QColor("#111214"))
+    palette.setColor(QPalette.Disabled, QPalette.ColorRole.Text, QColor("#7c7f86"))
+    palette.setColor(QPalette.Disabled, QPalette.ColorRole.ButtonText, QColor("#7c7f86"))
+    palette.setColor(QPalette.Disabled, QPalette.ColorRole.WindowText, QColor("#7c7f86"))
+    app.setPalette(palette)
+
+
 class SortableTableWidgetItem(QTableWidgetItem):
     def __init__(self, text: str, sort_value=None) -> None:
         super().__init__(text)
@@ -118,6 +188,38 @@ class SortableTableWidgetItem(QTableWidgetItem):
     def __lt__(self, other: QTableWidgetItem) -> bool:
         other_sort_value = getattr(other, "sort_value", other.text())
         return self.sort_value < other_sort_value
+
+
+def settlement_type_label(value: str) -> str:
+    if not value:
+        return ""
+    return value[:1].upper() + value[1:]
+
+
+def _contrast_color(background: QColor) -> QColor:
+    luminance = (background.red() * 299 + background.green() * 587 + background.blue() * 114) / 1000
+    return QColor("#111111") if luminance >= 160 else QColor("#ffffff")
+
+
+def apply_background_to_table_row(table: QTableWidget, row: int, color_hex: str) -> None:
+    background = QColor(color_hex)
+    if not background.isValid():
+        return
+    foreground = _contrast_color(background)
+    for column in range(table.columnCount()):
+        item = table.item(row, column)
+        if item is None:
+            continue
+        item.setBackground(background)
+        item.setForeground(foreground)
+
+
+def apply_background_to_list_item(item: QListWidgetItem, color_hex: str) -> None:
+    background = QColor(color_hex)
+    if not background.isValid():
+        return
+    item.setBackground(background)
+    item.setForeground(_contrast_color(background))
 
 
 class FinalInvoicePreviewDialog(QDialog):
@@ -264,6 +366,7 @@ class FinalInvoicePreviewDialog(QDialog):
 
         def _build_invoice_body_html(self, summary_background: str, table_header_background: str) -> str:
                 receipt_sections: list[str] = []
+                aggregated_items: dict[str, dict[str, Decimal | int | bool]] = {}
                 for receipt in self.final_invoice.receipts:
                         item_rows = "".join(
                                 (
@@ -276,6 +379,22 @@ class FinalInvoicePreviewDialog(QDialog):
                                 )
                                 for item in receipt.items
                         )
+                        for item in receipt.items:
+                                aggregated_item = aggregated_items.setdefault(
+                                        item.product_name,
+                                        {
+                                                "quantity": 0,
+                                                "weight": Decimal("0.000"),
+                                                "has_quantity": False,
+                                                "has_weight": False,
+                                        },
+                                )
+                                if item.quantity is not None:
+                                        aggregated_item["quantity"] = int(aggregated_item["quantity"] or 0) + item.quantity
+                                        aggregated_item["has_quantity"] = True
+                                if item.weight is not None:
+                                        aggregated_item["weight"] = Decimal(aggregated_item["weight"] or Decimal("0.000")) + item.weight
+                                        aggregated_item["has_weight"] = True
                         receipt_sections.append(
                                 "<div class='receipt-block'>"
                                 f"<div class='receipt-header'><span class='receipt-title'>Rachunek #{receipt.id}</span><span>Data: {escape(receipt.issue_date.isoformat())}</span><span>Razem: {escape(decimal_text(receipt.total))}</span></div>"
@@ -287,6 +406,24 @@ class FinalInvoicePreviewDialog(QDialog):
                         )
 
                 receipts_count = len(self.final_invoice.receipts)
+                aggregated_rows = "".join(
+                        (
+                            "<tr>"
+                            f"<td class='col-name'>{escape(product_name)}</td>"
+                            f"<td class='col-measure'>{escape(aggregate_measure_text(data['quantity'] if data['has_quantity'] else None, data['weight'] if data['has_weight'] else None))}</td>"
+                            "</tr>"
+                        )
+                        for product_name, data in aggregated_items.items()
+                    )
+                aggregated_html = (
+                        "<div class='receipt-block aggregate-block'>"
+                        "<div class='receipt-header'><span class='receipt-title'>Suma towarow</span></div>"
+                        "<table class='items-table aggregate-table'>"
+                        "<thead><tr><th>Towar</th><th>Ilosc / waga</th></tr></thead>"
+                        f"<tbody>{aggregated_rows}</tbody>"
+                        "</table>"
+                        "</div>"
+                    ) if aggregated_rows else ""
                 receipts_html = "".join(receipt_sections) or "<p class='empty'>Brak powiazanych rachunkow.</p>"
                 intro_text = "Dokument zbiorczy wygenerowany na podstawie rachunkow zarejestrowanych w systemie."
                 return f"""
@@ -385,6 +522,11 @@ class FinalInvoicePreviewDialog(QDialog):
                         font-weight: 700;
                         text-align: left;
                     }}
+                    .aggregate-block {{
+                        margin-bottom: 26px;
+                    }}
+                    .aggregate-table .col-name {{ width: 70%; }}
+                    .aggregate-table .col-measure {{ width: 30%; }}
                     .col-name {{ width: 46%; }}
                     .col-measure {{ width: 16%; text-align: center; }}
                     .col-money {{ width: 19%; text-align: right; }}
@@ -427,6 +569,7 @@ class FinalInvoicePreviewDialog(QDialog):
                         </tr>
                     </table>
 
+                    {aggregated_html}
                     {receipts_html}
                 </div>
                 """
@@ -586,7 +729,7 @@ class ReceiptEditor(QWidget):
         layout.addWidget(attachments_group)
 
         footer = QHBoxLayout()
-        self.total_label = QLabel("Razem: 0.00")
+        self.total_label = QLabel(f"Razem: {decimal_text(Decimal('0.00'))}")
         self.status_label = QLabel()
         self.status_label.setStyleSheet("color: #8b0000;")
         footer.addWidget(self.total_label)
@@ -796,6 +939,7 @@ class ReceiptEditor(QWidget):
             "weight": result.weight,
             "unit_price": result.unit_price,
             "value": result.value,
+            "price_driver": self.last_price_driver,
         }
 
         existing_row = self._find_matching_item_row(item_data)
@@ -831,7 +975,17 @@ class ReceiptEditor(QWidget):
             self.weight_input.setValue(float(item_data["weight"] or 0))
             self.unit_price_input.setValue(float(item_data["unit_price"] or 0))
             self.value_input.setValue(float(item_data["value"] or 0))
-            self.last_price_driver = "unit_price"
+            self.last_price_driver = str(
+                item_data.get(
+                    "price_driver",
+                    infer_price_driver(
+                        item_data["quantity"],
+                        item_data["weight"],
+                        item_data["unit_price"],
+                        item_data["value"],
+                    ),
+                )
+            )
         finally:
             self._building_form = False
 
@@ -863,6 +1017,7 @@ class ReceiptEditor(QWidget):
 
     def refresh_receipts(self) -> None:
         receipts = self.service.list_receipts()
+        color_by_nip = self.service.get_client_color_map_by_nip()
         search_text = self.receipts_search_input.text().strip().lower()
         self.receipts_table.setSortingEnabled(False)
         self.receipts_table.setRowCount(0)
@@ -893,9 +1048,16 @@ class ReceiptEditor(QWidget):
                     table_item = SortableTableWidgetItem(value, value.lower())
                 if column == 0:
                     table_item.setData(Qt.UserRole, receipt.id)
-                if is_warning_total:
-                    table_item.setForeground(QColor("#b42318"))
                 self.receipts_table.setItem(row, column, table_item)
+
+            color_hex = color_by_nip.get(receipt.nip)
+            if color_hex:
+                apply_background_to_table_row(self.receipts_table, row, color_hex)
+            if is_warning_total:
+                for column in range(self.receipts_table.columnCount()):
+                    table_item = self.receipts_table.item(row, column)
+                    if table_item is not None:
+                        table_item.setForeground(QColor("#b42318"))
 
         self.receipts_table.setSortingEnabled(True)
         self.current_receipt_id = None
@@ -940,10 +1102,18 @@ class ReceiptEditor(QWidget):
                 "weight": receipt_item.weight,
                 "unit_price": receipt_item.unit_price,
                 "value": receipt_item.value,
+                "price_driver": infer_price_driver(
+                    receipt_item.quantity,
+                    receipt_item.weight,
+                    receipt_item.unit_price,
+                    receipt_item.value,
+                ),
             }
             for column, key in enumerate(["product_name", "quantity", "weight", "unit_price", "value"]):
                 value = item_data[key]
-                if isinstance(value, Decimal):
+                if key == "weight":
+                    text = weight_text(value)
+                elif isinstance(value, Decimal):
                     text = decimal_text(value)
                 else:
                     text = "" if value is None else str(value)
@@ -1026,21 +1196,44 @@ class ReceiptEditor(QWidget):
 
     def _merge_item_data(self, row: int, new_item_data: dict) -> dict:
         existing_data = self.items_table.item(row, 0).data(Qt.UserRole)
+        existing_price_driver = str(
+            existing_data.get(
+                "price_driver",
+                infer_price_driver(
+                    existing_data["quantity"],
+                    existing_data["weight"],
+                    existing_data["unit_price"],
+                    existing_data["value"],
+                ),
+            )
+        )
+        new_price_driver = str(
+            new_item_data.get(
+                "price_driver",
+                infer_price_driver(
+                    new_item_data["quantity"],
+                    new_item_data["weight"],
+                    new_item_data["unit_price"],
+                    new_item_data["value"],
+                ),
+            )
+        )
+        merged_price_driver = "value" if "value" in {existing_price_driver, new_price_driver} else "unit_price"
         if existing_data["quantity"] is not None:
             merged_quantity = existing_data["quantity"] + new_item_data["quantity"]
             result = calculate_item(
                 quantity=merged_quantity,
                 weight=None,
-                unit_price=existing_data["unit_price"],
-                value=None,
+                unit_price=existing_data["unit_price"] if merged_price_driver == "unit_price" else None,
+                value=(existing_data["value"] + new_item_data["value"]) if merged_price_driver == "value" else None,
             )
         else:
             merged_weight = existing_data["weight"] + new_item_data["weight"]
             result = calculate_item(
                 quantity=None,
                 weight=merged_weight,
-                unit_price=existing_data["unit_price"],
-                value=None,
+                unit_price=existing_data["unit_price"] if merged_price_driver == "unit_price" else None,
+                value=(existing_data["value"] + new_item_data["value"]) if merged_price_driver == "value" else None,
             )
 
         return {
@@ -1049,12 +1242,15 @@ class ReceiptEditor(QWidget):
             "weight": result.weight,
             "unit_price": result.unit_price,
             "value": result.value,
+            "price_driver": merged_price_driver,
         }
 
     def _set_items_table_row(self, row: int, item_data: dict) -> None:
         for column, key in enumerate(["product_name", "quantity", "weight", "unit_price", "value"]):
             value = item_data[key]
-            if isinstance(value, Decimal):
+            if key == "weight":
+                text = weight_text(value)
+            elif isinstance(value, Decimal):
                 text = decimal_text(value)
             else:
                 text = "" if value is None else str(value)
@@ -1088,7 +1284,7 @@ class ReceiptEditor(QWidget):
         for row in range(self.items_table.rowCount()):
             data = self.items_table.item(row, 0).data(Qt.UserRole)
             total += data["value"]
-        self.total_label.setText(f"Razem: {money(total):.2f}")
+        self.total_label.setText(f"Razem: {decimal_text(total)}")
 
     def save_receipt(self) -> None:
         try:
@@ -1299,6 +1495,7 @@ class ClientsEditor(QWidget):
         self.service = service
         self.refresh_callback = refresh_callback
         self.current_client_id: int | None = None
+        self.current_settlement_type_name: str | None = None
 
         layout = QHBoxLayout(self)
         layout.addWidget(self._build_form_panel(), 2)
@@ -1309,18 +1506,6 @@ class ClientsEditor(QWidget):
         container = QWidget()
         layout = QVBoxLayout(container)
 
-        group = QGroupBox("Klient")
-        form = QFormLayout(group)
-        self.client_name_input = QLineEdit()
-        self.client_nip_input = QLineEdit()
-        form.addRow("Nazwa klienta", self.client_name_input)
-        form.addRow("NIP", self.client_nip_input)
-        layout.addWidget(group)
-
-        self.status_label = QLabel()
-        self.status_label.setStyleSheet("color: #8b0000;")
-        layout.addWidget(self.status_label)
-
         actions = QHBoxLayout()
         self.new_button = QPushButton("Nowy klient")
         self.save_button = QPushButton("Zapisz klienta")
@@ -1328,12 +1513,74 @@ class ClientsEditor(QWidget):
         actions.addWidget(self.new_button)
         actions.addWidget(self.save_button)
         actions.addWidget(self.delete_button)
+        actions.addStretch(1)
         layout.addLayout(actions)
+
+        group = QGroupBox("Klient")
+        form = QFormLayout(group)
+        self.client_name_input = QLineEdit()
+        self.client_nip_input = QLineEdit()
+        self.client_settlement_type_input = QComboBox()
+        form.addRow("Nazwa klienta", self.client_name_input)
+        form.addRow("NIP", self.client_nip_input)
+        form.addRow("Typ rozliczenia", self.client_settlement_type_input)
+        layout.addWidget(group)
+
+        settlement_group = QGroupBox("Typy rozliczenia")
+        settlement_layout = QVBoxLayout(settlement_group)
+        settlement_form = QFormLayout()
+        self.settlement_type_name_input = QLineEdit()
+        self.settlement_type_color_input = QLineEdit()
+        self.settlement_type_color_input.setReadOnly(True)
+        self.settlement_type_color_preview = QLabel()
+        self.settlement_type_color_preview.setFixedSize(72, 28)
+        self.settlement_type_color_preview.setAlignment(Qt.AlignCenter)
+        self.choose_settlement_type_color_button = QPushButton("Wybierz kolor")
+        color_row = QWidget()
+        color_row_layout = QHBoxLayout(color_row)
+        color_row_layout.setContentsMargins(0, 0, 0, 0)
+        color_row_layout.addWidget(self.settlement_type_color_preview)
+        color_row_layout.addWidget(self.settlement_type_color_input)
+        color_row_layout.addWidget(self.choose_settlement_type_color_button)
+        settlement_form.addRow("Nazwa typu", self.settlement_type_name_input)
+        settlement_form.addRow("Kolor", color_row)
+        settlement_layout.addLayout(settlement_form)
+
+        settlement_actions = QHBoxLayout()
+        self.new_settlement_type_button = QPushButton("Nowy typ")
+        self.save_settlement_type_button = QPushButton("Zapisz typ")
+        self.delete_settlement_type_button = QPushButton("Usun typ")
+        settlement_actions.addWidget(self.new_settlement_type_button)
+        settlement_actions.addWidget(self.save_settlement_type_button)
+        settlement_actions.addWidget(self.delete_settlement_type_button)
+        settlement_layout.addLayout(settlement_actions)
+
+        self.settlement_types_table = QTableWidget(0, 2)
+        self.settlement_types_table.setHorizontalHeaderLabels(["Typ", "Kolor"])
+        self.settlement_types_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.settlement_types_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.settlement_types_table.horizontalHeader().setStretchLastSection(True)
+        self.settlement_types_table.itemSelectionChanged.connect(self.load_selected_settlement_type)
+        settlement_layout.addWidget(self.settlement_types_table)
+        layout.addWidget(settlement_group)
+
+        self.client_status_label = QLabel()
+        self.client_status_label.setStyleSheet("color: #8b0000;")
+        layout.addWidget(self.client_status_label)
+
+        self.settlement_types_status_label = QLabel()
+        self.settlement_types_status_label.setStyleSheet("color: #8b0000;")
+        layout.addWidget(self.settlement_types_status_label)
         layout.addStretch(1)
 
         self.new_button.clicked.connect(self.reset_form)
         self.save_button.clicked.connect(self.save_client)
         self.delete_button.clicked.connect(self.delete_client)
+        self.new_settlement_type_button.clicked.connect(self.reset_settlement_type_form)
+        self.save_settlement_type_button.clicked.connect(self.save_settlement_type)
+        self.delete_settlement_type_button.clicked.connect(self.delete_settlement_type)
+        self.choose_settlement_type_color_button.clicked.connect(self.choose_settlement_type_color)
+        self._set_settlement_type_color(self._default_settlement_type_color())
         return container
 
     def _build_list_panel(self) -> QWidget:
@@ -1344,8 +1591,8 @@ class ClientsEditor(QWidget):
         self.clients_search_input.setPlaceholderText("Szukaj po nazwie klienta lub NIP")
         self.clients_search_input.textChanged.connect(self.refresh_clients)
         layout.addWidget(self.clients_search_input)
-        self.clients_table = QTableWidget(0, 3)
-        self.clients_table.setHorizontalHeaderLabels(["ID", "Nazwa klienta", "NIP"])
+        self.clients_table = QTableWidget(0, 4)
+        self.clients_table.setHorizontalHeaderLabels(["ID", "Nazwa klienta", "NIP", "Typ rozliczenia"])
         self.clients_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.clients_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.clients_table.horizontalHeader().setStretchLastSection(True)
@@ -1354,20 +1601,37 @@ class ClientsEditor(QWidget):
         return container
 
     def refresh_clients(self) -> None:
+        settlement_type_configs = self.service.list_settlement_type_configs()
+        self._refresh_settlement_type_controls(settlement_type_configs)
         clients = self.service.list_clients()
+        color_by_type = {
+            config.settlement_type: config.color_hex
+            for config in settlement_type_configs
+        }
         search_text = self.clients_search_input.text().strip().lower()
         self.clients_table.setRowCount(0)
         for client in clients:
-            if search_text and search_text not in client.company_name.lower() and search_text not in client.nip.lower():
+            settlement_label = settlement_type_label(client.settlement_type)
+            if (
+                search_text
+                and search_text not in client.company_name.lower()
+                and search_text not in client.nip.lower()
+                and search_text not in settlement_label.lower()
+            ):
                 continue
             row = self.clients_table.rowCount()
             self.clients_table.insertRow(row)
-            values = [str(client.id), client.company_name, client.nip]
+            values = [str(client.id), client.company_name, client.nip, settlement_label]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.UserRole, client.id)
+                if column == 3:
+                    item.setData(Qt.UserRole, client.settlement_type)
                 self.clients_table.setItem(row, column, item)
+            color_hex = color_by_type.get(client.settlement_type)
+            if color_hex:
+                apply_background_to_table_row(self.clients_table, row, color_hex)
 
     def load_selected_client(self) -> None:
         selected = self.clients_table.selectedItems()
@@ -1377,7 +1641,10 @@ class ClientsEditor(QWidget):
         self.current_client_id = self.clients_table.item(row, 0).data(Qt.UserRole)
         self.client_name_input.setText(self.clients_table.item(row, 1).text())
         self.client_nip_input.setText(self.clients_table.item(row, 2).text())
-        self.status_label.clear()
+        settlement_type = self.clients_table.item(row, 3).data(Qt.UserRole)
+        settlement_index = self.client_settlement_type_input.findData(settlement_type)
+        self.client_settlement_type_input.setCurrentIndex(settlement_index if settlement_index >= 0 else 0)
+        self.client_status_label.clear()
 
     def save_client(self) -> None:
         try:
@@ -1385,6 +1652,7 @@ class ClientsEditor(QWidget):
                 ClientInput(
                     company_name=self.client_name_input.text(),
                     nip=self.client_nip_input.text(),
+                    settlement_type=self.client_settlement_type_input.currentData(),
                 ),
                 client_id=self.current_client_id,
             )
@@ -1395,8 +1663,8 @@ class ClientsEditor(QWidget):
         self.refresh_clients()
         self.refresh_callback()
         self.reset_form()
-        self.status_label.setStyleSheet("color: #006400;")
-        self.status_label.setText("Klient zapisany.")
+        self.client_status_label.setStyleSheet("color: #006400;")
+        self.client_status_label.setText("Klient zapisany.")
 
     def delete_client(self) -> None:
         if self.current_client_id is None:
@@ -1414,15 +1682,144 @@ class ClientsEditor(QWidget):
         self.refresh_clients()
         self.refresh_callback()
         self.reset_form()
-        self.status_label.setStyleSheet("color: #006400;")
-        self.status_label.setText("Klient usuniety.")
+        self.client_status_label.setStyleSheet("color: #006400;")
+        self.client_status_label.setText("Klient usuniety.")
 
     def reset_form(self) -> None:
         self.current_client_id = None
         self.client_name_input.clear()
         self.client_nip_input.clear()
+        if self.client_settlement_type_input.count() > 0:
+            self.client_settlement_type_input.setCurrentIndex(0)
         self.clients_table.clearSelection()
-        self.status_label.clear()
+        self.client_status_label.clear()
+
+    def _default_settlement_type_color(self) -> str:
+        return DEFAULT_SETTLEMENT_TYPE_COLORS.get("inne", next(iter(DEFAULT_SETTLEMENT_TYPE_COLORS.values()), "#ECECEC"))
+
+    def _set_settlement_type_color(self, color_hex: str) -> None:
+        self.settlement_type_color_input.setText(color_hex)
+        self.settlement_type_color_preview.setStyleSheet(
+            f"background-color: {color_hex}; border: 1px solid #9ca3af; border-radius: 4px;"
+        )
+
+    def _refresh_settlement_type_controls(self, configs) -> None:
+        current_client_type = self.client_settlement_type_input.currentData()
+        current_type_name = self.current_settlement_type_name
+        type_names = [config.settlement_type for config in configs]
+
+        self.client_settlement_type_input.blockSignals(True)
+        self.client_settlement_type_input.clear()
+        for config in configs:
+            self.client_settlement_type_input.addItem(
+                settlement_type_label(config.settlement_type),
+                config.settlement_type,
+            )
+        self.client_settlement_type_input.setEnabled(bool(configs))
+        if configs:
+            if current_client_type in type_names:
+                self.client_settlement_type_input.setCurrentIndex(
+                    self.client_settlement_type_input.findData(current_client_type)
+                )
+            else:
+                self.client_settlement_type_input.setCurrentIndex(0)
+        self.client_settlement_type_input.blockSignals(False)
+
+        self.settlement_types_table.blockSignals(True)
+        self.settlement_types_table.setRowCount(0)
+        for config in configs:
+            row = self.settlement_types_table.rowCount()
+            self.settlement_types_table.insertRow(row)
+            type_item = QTableWidgetItem(settlement_type_label(config.settlement_type))
+            type_item.setData(Qt.UserRole, config.settlement_type)
+            color_item = QTableWidgetItem(config.color_hex)
+            self.settlement_types_table.setItem(row, 0, type_item)
+            self.settlement_types_table.setItem(row, 1, color_item)
+            apply_background_to_table_row(self.settlement_types_table, row, config.color_hex)
+        self.settlement_types_table.blockSignals(False)
+
+        if current_type_name in type_names:
+            for row in range(self.settlement_types_table.rowCount()):
+                item = self.settlement_types_table.item(row, 0)
+                if item is not None and item.data(Qt.UserRole) == current_type_name:
+                    self.settlement_types_table.selectRow(row)
+                    self.load_selected_settlement_type()
+                    break
+        elif self.current_settlement_type_name is not None:
+            self.reset_settlement_type_form(clear_selection=True)
+
+    def load_selected_settlement_type(self) -> None:
+        selected = self.settlement_types_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        type_item = self.settlement_types_table.item(row, 0)
+        color_item = self.settlement_types_table.item(row, 1)
+        if type_item is None or color_item is None:
+            return
+        self.current_settlement_type_name = type_item.data(Qt.UserRole)
+        self.settlement_type_name_input.setText(self.current_settlement_type_name)
+        self._set_settlement_type_color(color_item.text())
+        self.settlement_types_status_label.clear()
+
+    def reset_settlement_type_form(self, clear_selection: bool = True) -> None:
+        self.current_settlement_type_name = None
+        self.settlement_type_name_input.clear()
+        self._set_settlement_type_color(self._default_settlement_type_color())
+        if clear_selection:
+            self.settlement_types_table.clearSelection()
+        self.settlement_types_status_label.clear()
+
+    def choose_settlement_type_color(self) -> None:
+        current_color = QColor(self.settlement_type_color_input.text())
+        if not current_color.isValid():
+            current_color = QColor(self._default_settlement_type_color())
+        selected_color = QColorDialog.getColor(current_color, self, "Wybierz kolor typu rozliczenia")
+        if not selected_color.isValid():
+            return
+        self._set_settlement_type_color(selected_color.name().upper())
+
+    def save_settlement_type(self) -> None:
+        try:
+            saved_config = self.service.save_settlement_type_config(
+                SettlementTypeConfigInput(
+                    settlement_type=self.settlement_type_name_input.text(),
+                    color_hex=self.settlement_type_color_input.text(),
+                    original_settlement_type=self.current_settlement_type_name,
+                )
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Blad", str(exc))
+            return
+
+        self.current_settlement_type_name = saved_config.settlement_type
+        self.refresh_callback()
+        self.settlement_types_status_label.setStyleSheet("color: #006400;")
+        self.settlement_types_status_label.setText("Typ rozliczenia zapisany.")
+
+    def delete_settlement_type(self) -> None:
+        if self.current_settlement_type_name is None:
+            QMessageBox.warning(self, "Blad", "Wybierz typ rozliczenia do usuniecia.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Usun typ rozliczenia",
+            "Czy na pewno usunac wybrany typ rozliczenia? Klienci zostana przypisani do innego typu.",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        try:
+            replacement = self.service.delete_settlement_type_config(self.current_settlement_type_name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Blad", str(exc))
+            return
+
+        self.reset_settlement_type_form()
+        self.refresh_callback()
+        self.settlement_types_status_label.setStyleSheet("color: #006400;")
+        self.settlement_types_status_label.setText(
+            f"Typ rozliczenia usuniety. Klienci przypisani do: {settlement_type_label(replacement)}."
+        )
 
 
 class ProductsEditor(QWidget):
@@ -1545,6 +1942,7 @@ class FinalInvoiceEditor(QWidget):
         super().__init__()
         self.service = service
         self.clients_cache: dict[int, tuple[str, str]] = {}
+        self.client_color_map_by_nip: dict[str, str] = {}
         self.current_final_invoice_id: int | None = None
         self.final_invoices_cache: list[FinalInvoice] = []
         layout = QHBoxLayout(self)
@@ -1585,7 +1983,7 @@ class FinalInvoiceEditor(QWidget):
         self.available_receipts_list = QListWidget()
         layout.addWidget(self.available_receipts_list)
 
-        self.total_label = QLabel("Razem: 0.00")
+        self.total_label = QLabel(f"Razem: {decimal_text(Decimal('0.00'))}")
         self.status_label = QLabel()
         self.status_label.setStyleSheet("color: #8b0000;")
         self.create_button = QPushButton("Utworz fakture koncowa")
@@ -1621,6 +2019,7 @@ class FinalInvoiceEditor(QWidget):
         return container
 
     def refresh(self) -> None:
+        self.client_color_map_by_nip = self.service.get_client_color_map_by_nip()
         self._refresh_clients()
         self._refresh_available_receipts()
         self._refresh_final_invoices()
@@ -1663,10 +2062,15 @@ class FinalInvoiceEditor(QWidget):
                 continue
             if selected_nip and receipt.nip != selected_nip:
                 continue
-            item = QListWidgetItem(f"{receipt.company_name} | {receipt.nip} | {receipt.issue_date.isoformat()}")
+            item = QListWidgetItem(
+                f"{receipt.company_name} | {receipt.nip} | {receipt.issue_date.isoformat()} | {decimal_text(receipt.total)}"
+            )
             item.setData(Qt.UserRole, {"id": receipt.id, "total": receipt.total})
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
+            color_hex = self.client_color_map_by_nip.get(receipt.nip)
+            if color_hex:
+                apply_background_to_list_item(item, color_hex)
             self.available_receipts_list.addItem(item)
         self.available_receipts_list.blockSignals(False)
 
@@ -1697,6 +2101,10 @@ class FinalInvoiceEditor(QWidget):
                     item.setData(Qt.UserRole, final_invoice.id)
                 self.final_invoices_table.setItem(row, column, item)
 
+            color_hex = self.client_color_map_by_nip.get(final_invoice.nip)
+            if color_hex:
+                apply_background_to_table_row(self.final_invoices_table, row, color_hex)
+
             self.final_invoices_table.setSortingEnabled(True)
         self.current_final_invoice_id = None
         self.preview_button.setEnabled(False)
@@ -1707,7 +2115,7 @@ class FinalInvoiceEditor(QWidget):
             item = self.available_receipts_list.item(index)
             if item.checkState() == Qt.Checked:
                 total += item.data(Qt.UserRole)["total"]
-        self.total_label.setText(f"Razem: {money(total):.2f}")
+        self.total_label.setText(f"Razem: {decimal_text(total)}")
 
     def _on_client_changed(self) -> None:
         self._apply_selected_client()
@@ -1879,8 +2287,11 @@ class MainWindow(QMainWindow):
         self.admin_button.blockSignals(False)
 
     def refresh_related_views(self) -> None:
+        self.clients_editor.refresh_clients()
+        self.products_editor.refresh_products()
         self.receipt_editor.refresh_clients()
         self.receipt_editor.refresh_products()
+        self.receipt_editor.refresh_receipts()
         self.final_invoice_editor.refresh()
 
     def export_backup(self) -> None:
@@ -1908,10 +2319,9 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Blad importu", str(exc))
             return
-        self.receipt_editor.refresh_receipts()
+        self.refresh_related_views()
+        self.products_editor.reset_form()
         self.receipt_editor.reset_form()
-        self.clients_editor.refresh_clients()
-        self.final_invoice_editor.refresh()
         QMessageBox.information(self, "Import", "Backup zostal odtworzony.")
 
 
@@ -1919,6 +2329,7 @@ def run() -> int:
     init_database()
     app = QApplication(sys.argv)
     app.setWindowIcon(load_brand_icon())
+    apply_dark_theme(app)
     window = MainWindow()
     window.showMaximized()
     return app.exec()

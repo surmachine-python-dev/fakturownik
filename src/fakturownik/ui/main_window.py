@@ -2105,7 +2105,7 @@ class FinalInvoiceEditor(QWidget):
             if color_hex:
                 apply_background_to_table_row(self.final_invoices_table, row, color_hex)
 
-            self.final_invoices_table.setSortingEnabled(True)
+        self.final_invoices_table.setSortingEnabled(True)
         self.current_final_invoice_id = None
         self.preview_button.setEnabled(False)
 
